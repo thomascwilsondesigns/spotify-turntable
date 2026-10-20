@@ -193,10 +193,14 @@
   // that isn't a music track (e.g. podcasts).
   function trackInfo(item) {
     if (!item || item.type !== 'track') return null;
-    const images = (item.album && item.album.images) || [];   // largest first
+    const album = item.album || {};
+    const images = album.images || [];   // largest first
     return {
       id: item.id || item.uri,
       title: item.name,
+      artist: item.artists && item.artists[0] ? item.artists[0].name : null,
+      album: album.name || null,
+      albumId: album.id || null,
       art: images.length ? images[0].url : null,
       duration: (item.duration_ms || 0) / 1000,
     };
@@ -211,6 +215,135 @@
       current: trackInfo(queue && queue.currently_playing),
       next: upcoming[0] || null,
     };
+  }
+
+  // ---------------------------------------------------------------------
+  // Higher-resolution covers
+  // ---------------------------------------------------------------------
+  //
+  // Spotify lists covers up to 640px, which looks soft on an iPad. In
+  // order, try:
+  //   1. Spotify's own larger copy of the same image (often 1500px or
+  //      more), under a different size code at the same address.
+  //   2. Apple Music's cover (via the public iTunes Search service),
+  //      only if it LOOKS like the Spotify cover, so a different edition's
+  //      artwork never shows up. Same rules as the album display's
+  //      hires_art.py.
+  //   3. The 640px cover.
+  // Each album is looked up once per page load.
+
+  const SPOTIFY_640 = '/ab67616d0000b273';
+  const SPOTIFY_LARGE = '/ab67616d000082c1';
+  const APPLE_PX = 1400;
+  const MIN_SIZE_GAIN = 1.25;         // only worth it if this much bigger
+  // Average difference (0-255) between two covers shrunk to thumbnails:
+  // the same artwork scores 0-2, a different edition 22 or more.
+  const MAX_LOOK_DIFFERENCE = 12;
+  const ART_TIMEOUT_MS = 5000;        // never hold up a record longer than this
+
+  // Words that differ between editions of the same album.
+  const EDITION_WORDS = new Set(('remaster remastered deluxe edition expanded version anniversary ' +
+    'bonus track tracks special collector collectors original recording mono stereo reissue ' +
+    'the a an and ep lp single album vol volume').split(' '));
+
+  const plain = s => (s || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  function nameWords(s) {
+    const all = plain(s);
+    const kept = all.filter(w => !EDITION_WORDS.has(w) && !/^\d+$/.test(w));
+    return new Set(kept.length ? kept : all);
+  }
+  // 0-1: how well two album names match, ignoring edition wording.
+  function albumNameScore(ours, theirs) {
+    const a = nameWords(ours), b = nameWords(theirs);
+    if (!a.size || !b.size) return 0;
+    const shared = [...a].filter(w => b.has(w)).length;
+    if (shared === a.size && shared === b.size) return 1;
+    if (shared === a.size || shared === b.size) return 0.6 + 0.4 * shared / Math.max(a.size, b.size);
+    return shared / (a.size + b.size - shared);
+  }
+  function artistMatches(ours, theirs) {
+    const a = plain(ours).join(' '), b = plain(theirs).join(' ');
+    if (!a || !b) return false;
+    const wb = nameWords(theirs);
+    return a.includes(b) || b.includes(a) || [...nameWords(ours)].some(w => wb.has(w));
+  }
+
+  function loadImage(url) {   // with pixel access, for comparing covers
+    return new Promise(resolve => {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.onload = () => resolve(im);
+      im.onerror = () => resolve(null);
+      im.src = url;
+    });
+  }
+
+  function thumbnail(im) {
+    // Shrink in steps so the result is a fair average of the whole cover.
+    let src = im, size = Math.min(im.naturalWidth, im.naturalHeight);
+    const sx = (im.naturalWidth - size) / 2, sy = (im.naturalHeight - size) / 2;
+    let first = true;
+    for (const target of [192, 96, 48, 24]) {
+      const c = document.createElement('canvas');
+      c.width = c.height = target;
+      const g = c.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      if (first) g.drawImage(src, sx, sy, size, size, 0, 0, target, target);
+      else g.drawImage(src, 0, 0, target, target);
+      src = c;
+      first = false;
+    }
+    return src.getContext('2d').getImageData(0, 0, 24, 24).data;
+  }
+
+  function lookDifference(a, b) {
+    const ta = thumbnail(a), tb = thumbnail(b);
+    let sum = 0, n = 0;
+    for (let i = 0; i < ta.length; i += 4) {
+      for (let k = 0; k < 3; k++) { sum += Math.abs(ta[i + k] - tb[i + k]); n++; }
+    }
+    return sum / n;
+  }
+
+  async function appleCover(track, reference) {
+    const term = `${track.artist} ${track.album}`;
+    const res = await fetch('https://itunes.apple.com/search?entity=album&limit=15&term=' + encodeURIComponent(term));
+    const results = ((await res.json()).results || [])
+      .map(r => ({ score: albumNameScore(track.album, r.collectionName), r }))
+      .filter(x => x.score >= 0.5 && artistMatches(track.artist, x.r.artistName) && x.r.artworkUrl100)
+      .sort((x, y) => y.score - x.score)
+      .slice(0, 3);
+    for (const { r } of results) {
+      const url = r.artworkUrl100.replace(/\/\d+x\d+bb\./, `/${APPLE_PX}x${APPLE_PX}bb.`);
+      const im = await loadImage(url);
+      if (!im || Math.min(im.naturalWidth, im.naturalHeight) < reference.naturalWidth * MIN_SIZE_GAIN) continue;
+      if (lookDifference(im, reference) <= MAX_LOOK_DIFFERENCE) return url;
+    }
+    return null;
+  }
+
+  async function findBestCover(track) {
+    const large = track.art.replace(SPOTIFY_640, SPOTIFY_LARGE);
+    if (large !== track.art) {
+      const im = await loadImage(large);
+      if (im && im.naturalWidth >= 640 * MIN_SIZE_GAIN) return large;
+    }
+    if (track.artist && track.album) {
+      try {
+        const reference = await loadImage(track.art);
+        if (reference) return (await appleCover(track, reference)) || track.art;
+      } catch (e) {}
+    }
+    return track.art;
+  }
+
+  const coverCache = new Map();
+  // The best cover address for a track, or its own if the search takes too long.
+  function bestCover(track) {
+    if (!track || !track.art) return Promise.resolve(null);
+    const key = track.albumId || track.art;
+    if (!coverCache.has(key)) coverCache.set(key, findBestCover(track).catch(() => track.art));
+    return Promise.race([coverCache.get(key), wait(ART_TIMEOUT_MS).then(() => track.art)]);
   }
 
   // ---------------------------------------------------------------------
@@ -282,28 +415,28 @@
   }
   requestAnimationFrame(frame);
 
-  // Resolves once the image is in the browser cache (or failed to load),
-  // so a record never slides in blank.
-  function preload(url) {
-    return new Promise(resolve => {
-      if (!url) return resolve();
-      const im = new Image();
-      im.onload = im.onerror = () => resolve();
-      im.src = url;
-    });
+  // The best cover address for a track, downloaded and decoded, so a
+  // record never slides in blank or stutters the animation.
+  async function readyCover(track) {
+    const url = await bestCover(track);
+    if (!url) return null;
+    const im = new Image();
+    im.src = url;
+    try { await im.decode(); } catch (e) {}
+    return url;
   }
 
-  function setRecord(deck, track) {
+  function setRecord(deck, track, url) {
     deck.id = track ? track.id : null;
-    if (track && track.art) deck.img.src = track.art;
+    if (url) deck.img.src = url;
     else deck.img.removeAttribute('src');
   }
 
   // Drop the record on this deck and slide in a new one (not spinning).
   async function swap(deck, track) {
     deck.slot.classList.add('out');
-    await Promise.all([wait(SLIDE_MS), preload(track && track.art)]);
-    setRecord(deck, track);
+    const [, url] = await Promise.all([wait(SLIDE_MS), readyCover(track)]);
+    setRecord(deck, track, url);
     deck.speed = 0;
     deck.ramp = null;
     deck.angle = Math.random() * 360;
@@ -330,9 +463,9 @@
 
     if (!started) {
       started = true;
-      await Promise.all([preload(s.current && s.current.art), preload(s.next && s.next.art)]);
-      setRecord(decks[p], s.current);
-      setRecord(decks[1 - p], s.next);
+      const [curUrl, nextUrl] = await Promise.all([readyCover(s.current), readyCover(s.next)]);
+      setRecord(decks[p], s.current, curUrl);
+      setRecord(decks[1 - p], s.next, nextUrl);
       playing = s.isPlaying && !!curId;
       rampTo(decks[p], playing ? FULL : 0, 1200, easeInOut);
       return;
