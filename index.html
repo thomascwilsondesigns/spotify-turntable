@@ -73,7 +73,7 @@
   // The playing deck spins. When Spotify moves on, the waiting deck spins
   // up, the old one brakes, then the old record is peeled off and the new
   // "next" track is placed down. Decks take turns playing, so records never
-  // swap places. A still record can be turned by hand.
+  // swap places. Either record can be turned by hand.
   //
   // Add ?demo to the address to run on made-up tracks without Spotify,
   // or ?logout to forget the Spotify login.
@@ -408,15 +408,16 @@
       }
       if (!d.drag) d.angle = (d.angle + d.speed * dt) % 360;
       d.rec.style.transform = `rotate(${d.angle}deg)`;
-      d.slot.classList.toggle('draggable', isStill(d));
+      d.slot.classList.toggle('draggable', canGrab(d));
     }
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
 
-  // A record that isn't turning or moving can be turned by hand. It stays
-  // wherever it's let go, and later spins up from that angle.
-  const isStill = d => d.speed === 0 && !d.ramp && !d.moving;
+  // Any record on its platter can be turned by hand, spinning or not. The
+  // music isn't affected: while held it follows the finger, and once let
+  // go it carries on at its own speed from wherever it was left.
+  const canGrab = d => !d.moving;
 
   function pointerAngle(deck, e) {
     const r = deck.slot.getBoundingClientRect();
@@ -432,7 +433,7 @@
 
   for (const d of decks) {
     d.slot.addEventListener('pointerdown', e => {
-      if (!isStill(d)) return;
+      if (!canGrab(d)) return;
       d.drag = { startPointer: pointerAngle(d, e), startAngle: d.angle };
       d.slot.setPointerCapture(e.pointerId);
       d.slot.classList.add('dragging');
@@ -511,7 +512,6 @@
   async function advance(next) {
     const old = decks[p];
     p = 1 - p;
-    endDrag(decks[p]);
     rampTo(decks[p], playing ? FULL : 0, 1500, easeInOut);
     rampTo(old, 0, 1000, easeOut);
     await wait(1700);
