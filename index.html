@@ -10,10 +10,6 @@
 <meta name="theme-color" content="#000000">
 <title>Turntable</title>
 <style>
-  :root {
-    --out: translateY(100vh) scale(0.92);
-    --in: translateY(-100vh) scale(0.92);
-  }
   html, body {
     margin: 0; height: 100%; background: #000; overflow: hidden;
     -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
@@ -29,24 +25,24 @@
   .slot {
     --size: min(calc((100vw - var(--gap)) / 2), 96vh);
     width: var(--size); height: var(--size); position: relative; flex: none;
-    transition: transform 0.65s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.65s;
+    transform-origin: 50% 0%;   /* records peel up from their near edge */
+    touch-action: none;         /* a drag turns the record instead of scrolling */
   }
-  .slot.out { transform: var(--out); opacity: 0; }
-  .slot.pre { transform: var(--in); opacity: 0; transition: none; }
+  .slot.draggable { cursor: grab; }
+  .slot.dragging { cursor: grabbing; }
   @media (orientation: portrait) {
     #screen { flex-direction: column; --gap: calc(16vh / 3); }
     .slot { --size: min(calc((100vh - var(--gap)) / 2), 96vw); }
-    :root {
-      --out: translateX(100vw) scale(0.92);
-      --in: translateX(-100vw) scale(0.92);
-    }
   }
   .rec {
-    width: 100%; height: 100%; border-radius: 50%; overflow: hidden; box-sizing: border-box;
-    background: #111; border: calc(var(--size) * 0.012) solid #181818;
+    width: 100%; height: 100%; border-radius: 50%; overflow: hidden;
+    background: #111;   /* only shows on an empty deck */
     will-change: transform;
   }
-  .rec img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .rec img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    pointer-events: none; -webkit-user-drag: none; -webkit-touch-callout: none;
+  }
   .rec img:not([src]) { visibility: hidden; }
   #status {
     position: fixed; left: 0; right: 0; bottom: max(14px, env(safe-area-inset-bottom));
@@ -75,9 +71,9 @@
   // talks to Spotify directly; the login is kept in this browser.
   //
   // The playing deck spins. When Spotify moves on, the waiting deck spins
-  // up, the old one brakes, then the old record drops out and the new
-  // "next" track slides in. Decks take turns playing, so records never
-  // swap places.
+  // up, the old one brakes, then the old record is peeled off and the new
+  // "next" track is placed down. Decks take turns playing, so records never
+  // swap places. A still record can be turned by hand.
   //
   // Add ?demo to the address to run on made-up tracks without Spotify,
   // or ?logout to forget the Spotify login.
@@ -372,8 +368,10 @@
   // Decks and animation
   // ---------------------------------------------------------------------
 
-  const FULL = 360 / 1.8;        // 33 1/3 rpm, in degrees per second
-  const SLIDE_MS = 650;          // matches the .slot transition
+  const RPM = 8;
+  const FULL = RPM * 6;          // degrees per second
+  const PEEL_MS = 1000;          // lifting the old record off
+  const PLACE_MS = 1100;         // setting the new one down
 
   const decks = [...document.querySelectorAll('.slot')].map(slot => ({
     slot,
@@ -383,6 +381,8 @@
     speed: 0,
     ramp: null,
     id: null,
+    moving: false,     // being peeled off or placed down
+    drag: null,        // { startPointer, startAngle } while a finger turns it
   }));
   let p = 0;               // index of the playing deck
   let playing = false;
@@ -406,15 +406,47 @@
         d.speed = d.ramp.from + (d.ramp.to - d.ramp.from) * d.ramp.ease(k);
         if (k >= 1) d.ramp = null;
       }
-      d.angle = (d.angle + d.speed * dt) % 360;
+      if (!d.drag) d.angle = (d.angle + d.speed * dt) % 360;
       d.rec.style.transform = `rotate(${d.angle}deg)`;
+      d.slot.classList.toggle('draggable', isStill(d));
     }
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
 
+  // A record that isn't turning or moving can be turned by hand. It stays
+  // wherever it's let go, and later spins up from that angle.
+  const isStill = d => d.speed === 0 && !d.ramp && !d.moving;
+
+  function pointerAngle(deck, e) {
+    const r = deck.slot.getBoundingClientRect();
+    return Math.atan2(e.clientY - (r.top + r.height / 2), e.clientX - (r.left + r.width / 2)) * 180 / Math.PI;
+  }
+
+  function endDrag(deck) {
+    if (!deck.drag) return;
+    deck.drag = null;
+    deck.angle = ((deck.angle % 360) + 360) % 360;
+    deck.slot.classList.remove('dragging');
+  }
+
+  for (const d of decks) {
+    d.slot.addEventListener('pointerdown', e => {
+      if (!isStill(d)) return;
+      d.drag = { startPointer: pointerAngle(d, e), startAngle: d.angle };
+      d.slot.setPointerCapture(e.pointerId);
+      d.slot.classList.add('dragging');
+      e.preventDefault();
+    });
+    d.slot.addEventListener('pointermove', e => {
+      if (d.drag) d.angle = d.drag.startAngle + pointerAngle(d, e) - d.drag.startPointer;
+    });
+    d.slot.addEventListener('pointerup', () => endDrag(d));
+    d.slot.addEventListener('pointercancel', () => endDrag(d));
+  }
+
   // The best cover address for a track, downloaded and decoded, so a
-  // record never slides in blank or stutters the animation.
+  // record never goes down blank or stutters the animation.
   async function readyCover(track) {
     const url = await bestCover(track);
     if (!url) return null;
@@ -430,25 +462,56 @@
     else deck.img.removeAttribute('src');
   }
 
-  // Drop the record on this deck and slide in a new one (not spinning).
+  // Peel-and-place keyframes. The near (bottom) edge lifts first, as if
+  // a hand were peeling the record off the platter, then it's carried up
+  // and away; the new record comes down far edge first and settles flat.
+  // Depth is scaled to the record's size so it looks the same on any screen.
+  function liftedPose(size) {
+    return `perspective(${Math.round(size * 3.2)}px) rotateX(58deg) translate3d(0, -95%, ${Math.round(size * 0.5)}px)`;
+  }
+  function peelOffFrames(size) {
+    const p = `perspective(${Math.round(size * 3.2)}px)`;
+    return [
+      { transform: `${p} rotateX(0deg)`, opacity: 1 },
+      { transform: `${p} rotateX(32deg)`, opacity: 1, offset: 0.45 },
+      { transform: liftedPose(size), opacity: 0 },
+    ];
+  }
+  function placeOnFrames(size) {
+    const p = `perspective(${Math.round(size * 3.2)}px)`;
+    return [
+      { transform: liftedPose(size), opacity: 0 },
+      { transform: `${p} rotateX(30deg)`, opacity: 1, offset: 0.55 },
+      { transform: `${p} rotateX(-3deg)`, opacity: 1, offset: 0.85 },
+      { transform: `${p} rotateX(0deg)`, opacity: 1 },
+    ];
+  }
+
+  // Peel the record off this deck and place a new one down (not spinning).
   async function swap(deck, track) {
-    deck.slot.classList.add('out');
-    const [, url] = await Promise.all([wait(SLIDE_MS), readyCover(track)]);
+    endDrag(deck);
+    deck.moving = true;
+    const size = deck.slot.offsetWidth;
+    const off = deck.slot.animate(peelOffFrames(size),
+      { duration: PEEL_MS, easing: 'cubic-bezier(0.45, 0, 0.55, 1)', fill: 'forwards' });
+    const [, url] = await Promise.all([off.finished, readyCover(track)]);
     setRecord(deck, track, url);
     deck.speed = 0;
     deck.ramp = null;
     deck.angle = Math.random() * 360;
-    deck.slot.classList.remove('out');
-    deck.slot.classList.add('pre');
-    void deck.slot.offsetWidth;   // let the start position apply before animating
-    deck.slot.classList.remove('pre');
-    await wait(SLIDE_MS);
+    const on = deck.slot.animate(placeOnFrames(size),
+      { duration: PLACE_MS, easing: 'cubic-bezier(0.25, 0.1, 0.25, 1)', fill: 'forwards' });
+    off.cancel();
+    await on.finished;
+    on.cancel();       // ends flat, same as no transform
+    deck.moving = false;
   }
 
   // The waiting deck takes over; the old record brakes and is replaced by `next`.
   async function advance(next) {
     const old = decks[p];
     p = 1 - p;
+    endDrag(decks[p]);
     rampTo(decks[p], playing ? FULL : 0, 1500, easeInOut);
     rampTo(old, 0, 1000, easeOut);
     await wait(1700);
