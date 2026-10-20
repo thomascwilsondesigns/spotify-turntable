@@ -19,20 +19,23 @@
     -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
     font-family: -apple-system, system-ui, sans-serif;
   }
+  /* The records fill the screen out to its edges, with a fixed gap
+     between them; on very wide screens the height limits them instead. */
   #screen {
+    --gap: calc(16vw / 3);
     position: fixed; inset: 0;
-    display: flex; align-items: center; justify-content: space-evenly;
+    display: flex; align-items: center; justify-content: center; gap: var(--gap);
   }
   .slot {
-    --size: min(42vw, 78vh);
-    width: var(--size); height: var(--size); position: relative;
+    --size: min(calc((100vw - var(--gap)) / 2), 96vh);
+    width: var(--size); height: var(--size); position: relative; flex: none;
     transition: transform 0.65s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.65s;
   }
   .slot.out { transform: var(--out); opacity: 0; }
   .slot.pre { transform: var(--in); opacity: 0; transition: none; }
   @media (orientation: portrait) {
-    #screen { flex-direction: column; }
-    .slot { --size: min(78vw, 42vh); }
+    #screen { flex-direction: column; --gap: calc(16vh / 3); }
+    .slot { --size: min(calc((100vh - var(--gap)) / 2), 96vw); }
     :root {
       --out: translateX(100vw) scale(0.92);
       --in: translateX(-100vw) scale(0.92);
@@ -45,11 +48,6 @@
   }
   .rec img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .rec img:not([src]) { visibility: hidden; }
-  .hole {
-    position: absolute; left: 50%; top: 50%; width: 4%; height: 4%;
-    transform: translate(-50%, -50%); border-radius: 50%; box-sizing: border-box;
-    background: #000; border: 2px solid #2a2a2a;
-  }
   #status {
     position: fixed; left: 0; right: 0; bottom: max(14px, env(safe-area-inset-bottom));
     text-align: center; font-size: 13px; color: #555;
@@ -66,8 +64,8 @@
 </head>
 <body>
 <div id="screen">
-  <div class="slot"><div class="rec"><img alt=""></div><div class="hole"></div></div>
-  <div class="slot"><div class="rec"><img alt=""></div><div class="hole"></div></div>
+  <div class="slot"><div class="rec"><img alt=""></div></div>
+  <div class="slot"><div class="rec"><img alt=""></div></div>
 </div>
 <button id="connect" hidden>Connect Spotify</button>
 <div id="status"></div>
