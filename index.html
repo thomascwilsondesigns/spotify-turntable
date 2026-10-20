@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Turntable">
+<meta name="theme-color" content="#000000">
+<title>Turntable</title>
+<style>
+  :root {
+    --out: translateY(100vh) scale(0.92);
+    --in: translateY(-100vh) scale(0.92);
+  }
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, system-ui, sans-serif;
+  }
+  #screen {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: space-evenly;
+  }
+  .slot {
+    --size: min(42vw, 78vh);
+    width: var(--size); height: var(--size); position: relative;
+    transition: transform 0.65s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.65s;
+  }
+  .slot.out { transform: var(--out); opacity: 0; }
+  .slot.pre { transform: var(--in); opacity: 0; transition: none; }
+  @media (orientation: portrait) {
+    #screen { flex-direction: column; }
+    .slot { --size: min(78vw, 42vh); }
+    :root {
+      --out: translateX(100vw) scale(0.92);
+      --in: translateX(-100vw) scale(0.92);
+    }
+  }
+  .rec {
+    width: 100%; height: 100%; border-radius: 50%; overflow: hidden; box-sizing: border-box;
+    background: #111; border: calc(var(--size) * 0.012) solid #181818;
+    will-change: transform;
+  }
+  .rec img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .rec img:not([src]) { visibility: hidden; }
+  .hole {
+    position: absolute; left: 50%; top: 50%; width: 4%; height: 4%;
+    transform: translate(-50%, -50%); border-radius: 50%; box-sizing: border-box;
+    background: #000; border: 2px solid #2a2a2a;
+  }
+  #status {
+    position: fixed; left: 0; right: 0; bottom: max(14px, env(safe-area-inset-bottom));
+    text-align: center; font-size: 13px; color: #555;
+    opacity: 0; transition: opacity 0.6s; pointer-events: none;
+  }
+  #status.show { opacity: 1; }
+  #connect {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    padding: 14px 28px; border-radius: 999px; font-size: 17px;
+    background: transparent; color: #ddd; border: 1px solid #444; cursor: pointer;
+  }
+  #connect[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="screen">
+  <div class="slot"><div class="rec"><img alt=""></div><div class="hole"></div></div>
+  <div class="slot"><div class="rec"><img alt=""></div><div class="hole"></div></div>
+</div>
+<button id="connect" hidden>Connect Spotify</button>
+<div id="status"></div>
+<script>
+  // Turntable: two records showing the album art of what Spotify is
+  // playing now and what's queued next. Runs entirely in the browser and
+  // talks to Spotify directly; the login is kept in this browser.
+  //
+  // The playing deck spins. When Spotify moves on, the waiting deck spins
+  // up, the old one brakes, then the old record drops out and the new
+  // "next" track slides in. Decks take turns playing, so records never
+  // swap places.
+  //
+  // Add ?demo to the address to run on made-up tracks without Spotify,
+  // or ?logout to forget the Spotify login.
+
+  // ---------------------------------------------------------------------
+  // Spotify login (Authorization Code with PKCE — no secret needed)
+  // ---------------------------------------------------------------------
+
+  const CLIENT_ID = '7749b54e97d2428a93616d263b43069c';
+  const SCOPES = 'user-read-playback-state user-read-currently-playing';
+  // Must be listed exactly as a Redirect URI in the Spotify app's settings.
+  const REDIRECT_URI = location.origin + location.pathname;
+  const params = new URLSearchParams(location.search);
+  const DEMO = params.has('demo');
+
+  // Storage can be unavailable (private browsing); the page still runs,
+  // it just asks to log in again next time.
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+    del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+  };
+
+  class NeedLogin extends Error {}
+  class RateLimited extends Error {
+    constructor(seconds) { super('rate limited'); this.seconds = seconds; }
+  }
+
+  const b64url = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  async function startLogin() {
+    const verifier = b64url(crypto.getRandomValues(new Uint8Array(64)));
+    const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+    const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    store.set('pkce_verifier', verifier);
+    store.set('pkce_state', state);
+    location.href = 'https://accounts.spotify.com/authorize?' + new URLSearchParams({
+      client_id: CLIENT_ID,
+      response_type: 'code',
+      redirect_uri: REDIRECT_URI,
+      code_challenge_method: 'S256',
+      code_challenge: challenge,
+      scope: SCOPES,
+      state,
+    });
+  }
+
+  function forgetLogin() {
+    for (const k of ['access_token', 'expires_at', 'refresh_token']) store.del(k);
+  }
+
+  async function tokenRequest(fields) {
+    const res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: CLIENT_ID, ...fields }),
+    });
+    const reply = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (reply.error === 'invalid_grant') { forgetLogin(); throw new NeedLogin(); }
+      throw new Error(`Spotify login failed: ${reply.error_description || reply.error || res.status}`);
+    }
+    store.set('access_token', reply.access_token);
+    store.set('expires_at', String(Date.now() + (reply.expires_in || 3600) * 1000));
+    // Spotify may issue a replacement refresh token; keep the old one otherwise.
+    if (reply.refresh_token) store.set('refresh_token', reply.refresh_token);
+  }
+
+  // Back from Spotify's login page with ?code=… (or ?error=…).
+  async function finishLogin() {
+    if (!params.has('code') && !params.has('error')) return;
+    history.replaceState(null, '', REDIRECT_URI);
+    const verifier = store.get('pkce_verifier');
+    const ok = params.get('state') === store.get('pkce_state') && verifier && params.get('code');
+    store.del('pkce_verifier');
+    store.del('pkce_state');
+    if (params.get('error')) throw new Error(`Spotify refused the login: ${params.get('error')}`);
+    if (!ok) throw new Error('That login didn’t match. Try connecting again.');
+    await tokenRequest({
+      grant_type: 'authorization_code',
+      code: params.get('code'),
+      redirect_uri: REDIRECT_URI,
+      code_verifier: verifier,
+    });
+  }
+
+  async function accessToken() {
+    const token = store.get('access_token');
+    if (token && Date.now() < Number(store.get('expires_at')) - 60000) return token;
+    const refresh = store.get('refresh_token');
+    if (!refresh) throw new NeedLogin();
+    await tokenRequest({ grant_type: 'refresh_token', refresh_token: refresh });
+    return store.get('access_token');
+  }
+
+  // GET an API path; null when Spotify has nothing to report (204).
+  async function api(path, retried) {
+    const res = await fetch('https://api.spotify.com/v1' + path, {
+      headers: { Authorization: 'Bearer ' + await accessToken() },
+    });
+    if (res.status === 204) return null;
+    if (res.status === 401 && !retried) { store.del('access_token'); return api(path, true); }
+    if (res.status === 429) throw new RateLimited(Number(res.headers.get('Retry-After')) || 30);
+    if (!res.ok) throw new Error(`Spotify request failed (${res.status})`);
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }
+
+  // Reduce a Spotify track to what the decks need. Null for anything
+  // that isn't a music track (e.g. podcasts).
+  function trackInfo(item) {
+    if (!item || item.type !== 'track') return null;
+    const images = (item.album && item.album.images) || [];   // largest first
+    return {
+      id: item.id || item.uri,
+      title: item.name,
+      art: images.length ? images[0].url : null,
+      duration: (item.duration_ms || 0) / 1000,
+    };
+  }
+
+  async function spotifyState() {
+    const [player, queue] = await Promise.all([api('/me/player'), api('/me/player/queue')]);
+    const upcoming = ((queue && queue.queue) || []).map(trackInfo).filter(Boolean);
+    return {
+      isPlaying: !!(player && player.is_playing),
+      progress: player && player.progress_ms != null ? player.progress_ms / 1000 : null,
+      current: trackInfo(queue && queue.currently_playing),
+      next: upcoming[0] || null,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // Demo feed: made-up tracks that change every 12 seconds
+  // ---------------------------------------------------------------------
+
+  const DEMO_COVERS = [
+    ['#D85A30', '#FAEEDA', '<circle cx="62" cy="40" r="26"/><rect y="72" width="100" height="6"/>'],
+    ['#185FA5', '#B5D4F4', '<rect y="8" width="100" height="8"/><rect y="26" width="84" height="8"/><rect y="44" width="68" height="8"/><rect y="62" width="52" height="8"/>'],
+    ['#EF9F27', '#412402', '<polygon points="50,10 90,85 10,85"/>'],
+    ['#3B6D11', '#C0DD97', '<circle cx="35" cy="50" r="30"/><rect x="70" y="10" width="8" height="80"/>'],
+    ['#D4537E', '#26215C', '<rect x="12" y="12" width="36" height="36"/><rect x="52" y="52" width="36" height="36"/>'],
+  ];
+  const DEMO_SECONDS = 12;
+  const demoStart = Date.now();
+  function demoTrack(n) {
+    const [bg, fg, shapes] = DEMO_COVERS[n % DEMO_COVERS.length];
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="${bg}"/><g fill="${fg}">${shapes}</g></svg>`;
+    return { id: 'demo' + n, title: 'Demo ' + n, art: 'data:image/svg+xml,' + encodeURIComponent(svg), duration: DEMO_SECONDS };
+  }
+  async function demoState() {
+    const t = (Date.now() - demoStart) / 1000;
+    const n = Math.floor(t / DEMO_SECONDS);
+    return { isPlaying: true, progress: t % DEMO_SECONDS, current: demoTrack(n), next: demoTrack(n + 1) };
+  }
+
+  // ---------------------------------------------------------------------
+  // Decks and animation
+  // ---------------------------------------------------------------------
+
+  const FULL = 360 / 1.8;        // 33 1/3 rpm, in degrees per second
+  const SLIDE_MS = 650;          // matches the .slot transition
+
+  const decks = [...document.querySelectorAll('.slot')].map(slot => ({
+    slot,
+    rec: slot.querySelector('.rec'),
+    img: slot.querySelector('img'),
+    angle: Math.random() * 360,
+    speed: 0,
+    ramp: null,
+    id: null,
+  }));
+  let p = 0;               // index of the playing deck
+  let playing = false;
+  let started = false;
+
+  const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  const easeOut = t => 1 - (1 - t) * (1 - t);
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+
+  function rampTo(deck, to, ms, ease) {
+    deck.ramp = { from: deck.speed, to, start: performance.now(), ms, ease };
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    for (const d of decks) {
+      if (d.ramp) {
+        const k = Math.min(1, (now - d.ramp.start) / d.ramp.ms);
+        d.speed = d.ramp.from + (d.ramp.to - d.ramp.from) * d.ramp.ease(k);
+        if (k >= 1) d.ramp = null;
+      }
+      d.angle = (d.angle + d.speed * dt) % 360;
+      d.rec.style.transform = `rotate(${d.angle}deg)`;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // Resolves once the image is in the browser cache (or failed to load),
+  // so a record never slides in blank.
+  function preload(url) {
+    return new Promise(resolve => {
+      if (!url) return resolve();
+      const im = new Image();
+      im.onload = im.onerror = () => resolve();
+      im.src = url;
+    });
+  }
+
+  function setRecord(deck, track) {
+    deck.id = track ? track.id : null;
+    if (track && track.art) deck.img.src = track.art;
+    else deck.img.removeAttribute('src');
+  }
+
+  // Drop the record on this deck and slide in a new one (not spinning).
+  async function swap(deck, track) {
+    deck.slot.classList.add('out');
+    await Promise.all([wait(SLIDE_MS), preload(track && track.art)]);
+    setRecord(deck, track);
+    deck.speed = 0;
+    deck.ramp = null;
+    deck.angle = Math.random() * 360;
+    deck.slot.classList.remove('out');
+    deck.slot.classList.add('pre');
+    void deck.slot.offsetWidth;   // let the start position apply before animating
+    deck.slot.classList.remove('pre');
+    await wait(SLIDE_MS);
+  }
+
+  // The waiting deck takes over; the old record brakes and is replaced by `next`.
+  async function advance(next) {
+    const old = decks[p];
+    p = 1 - p;
+    rampTo(decks[p], playing ? FULL : 0, 1500, easeInOut);
+    rampTo(old, 0, 1000, easeOut);
+    await wait(1700);
+    await swap(old, next);
+  }
+
+  async function apply(s) {
+    const curId = s.current ? s.current.id : null;
+    const nextId = s.next ? s.next.id : null;
+
+    if (!started) {
+      started = true;
+      await Promise.all([preload(s.current && s.current.art), preload(s.next && s.next.art)]);
+      setRecord(decks[p], s.current);
+      setRecord(decks[1 - p], s.next);
+      playing = s.isPlaying && !!curId;
+      rampTo(decks[p], playing ? FULL : 0, 1200, easeInOut);
+      return;
+    }
+
+    if (!curId) {                      // nothing playing: stop, keep the records
+      if (playing) { playing = false; rampTo(decks[p], 0, 800, easeOut); }
+      return;
+    }
+
+    if (curId !== decks[p].id) {
+      // Skipped back, or jumped to a track that wasn't next: put it on
+      // the waiting deck first so the usual transition can run.
+      if (curId !== decks[1 - p].id) await swap(decks[1 - p], s.current);
+      playing = s.isPlaying;
+      await advance(s.next);
+      return;
+    }
+
+    if (s.isPlaying !== playing) {
+      playing = s.isPlaying;
+      rampTo(decks[p], playing ? FULL : 0, playing ? 1200 : 800, playing ? easeInOut : easeOut);
+    }
+    if (nextId !== decks[1 - p].id) await swap(decks[1 - p], s.next);
+  }
+
+  // Animations run one at a time; while one runs, keep only the newest state.
+  let busy = false, pending = null;
+  async function handle(s) {
+    if (busy) { pending = s; return; }
+    busy = true;
+    try { await apply(s); } finally { busy = false; }
+    if (pending) { const q = pending; pending = null; handle(q); }
+  }
+
+  // ---------------------------------------------------------------------
+  // Polling
+  // ---------------------------------------------------------------------
+
+  const POLL_MS = 2500;
+  const ERROR_POLL_MS = 10000;
+  const statusEl = document.getElementById('status');
+  const connectBtn = document.getElementById('connect');
+
+  function status(text) {
+    if (text) statusEl.textContent = text;
+    statusEl.classList.toggle('show', !!text);
+  }
+
+  // Spotify sometimes keeps reporting "playing" after playback has
+  // stopped, with the position frozen. Treat a frozen position as paused.
+  const FROZEN_MS = 10000;
+  let frozen = { id: null, progress: null, since: 0 };
+  function isReallyPlaying(s) {
+    if (!s.isPlaying || !s.current || s.progress == null) {
+      frozen.progress = null;
+      return s.isPlaying;
+    }
+    if (s.current.id !== frozen.id || s.progress !== frozen.progress) {
+      frozen = { id: s.current.id, progress: s.progress, since: Date.now() };
+      return true;
+    }
+    return Date.now() - frozen.since < FROZEN_MS;
+  }
+
+  let timer = null;
+  async function poll() {
+    clearTimeout(timer);
+    let delay = POLL_MS;
+    try {
+      const s = await (DEMO ? demoState() : spotifyState());
+      s.isPlaying = isReallyPlaying(s);
+      connectBtn.hidden = true;
+      status(s.current ? '' : 'Nothing playing on Spotify');
+      handle(s);
+      // Check again right as the track ends, so the change shows promptly.
+      if (s.isPlaying && s.current && s.progress != null) {
+        const left = (s.current.duration - s.progress) * 1000;
+        if (left < delay) delay = Math.max(400, left + 400);
+      }
+    } catch (e) {
+      if (e instanceof NeedLogin) {
+        connectBtn.hidden = false;
+        status('');
+        return;                        // wait for the button
+      }
+      if (e instanceof RateLimited) {
+        delay = e.seconds * 1000;
+        status('Spotify asked to slow down. Retrying shortly…');
+      } else {
+        delay = ERROR_POLL_MS;
+        status(navigator.onLine === false ? 'Offline. Retrying…' : e.message);
+      }
+    }
+    timer = setTimeout(poll, delay);
+  }
+
+  connectBtn.addEventListener('click', () => {
+    startLogin().catch(e => status(e.message));
+  });
+
+  // Keep the screen awake where the browser allows it (needs a tap first).
+  async function keepAwake() {
+    try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+  document.addEventListener('click', keepAwake);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { last = performance.now(); keepAwake(); poll(); }
+  });
+
+  (async () => {
+    if (params.has('logout')) { forgetLogin(); history.replaceState(null, '', REDIRECT_URI); }
+    try { await finishLogin(); } catch (e) { status(e.message); }
+    poll();
+  })();
+</script>
+</body>
+</html>
